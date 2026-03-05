@@ -21,6 +21,44 @@ const dragOffset = ref({ x: 0, y: 0 })
 const wiringFrom = ref(null)
 const mousePos = ref({ x: 0, y: 0 })
 const showVerilog = ref(false)
+const showProblems = ref(true)
+const highlightedGateId = ref(null)
+const toasts = reactive([])
+
+function addToast(msg, type = 'error') {
+  const t = { id: nextId++, msg, type }
+  toasts.push(t)
+  setTimeout(() => {
+    const idx = toasts.findIndex(e => e.id === t.id)
+    if (idx !== -1) toasts.splice(idx, 1)
+  }, 3000)
+}
+
+function wouldCreateCycle(fromGateId, toGateId) {
+  const visited = new Set()
+  const stack = [fromGateId]
+  while (stack.length) {
+    const current = stack.pop()
+    if (current === toGateId) return true
+    if (visited.has(current)) continue
+    visited.add(current)
+    for (const w of wires) {
+      if (w.toGateId === current) stack.push(w.fromGateId)
+    }
+  }
+  return false
+}
+
+function getUnconnectedInputs(gate) {
+  const def = GATE_TYPES[gate.type]
+  const missing = []
+  for (let i = 0; i < def.inputs; i++) {
+    if (!wires.some(w => w.toGateId === gate.id && w.toPort === i)) {
+      missing.push(i)
+    }
+  }
+  return missing
+}
 
 function addGate(type, x, y) {
   const def = GATE_TYPES[type]
@@ -73,12 +111,33 @@ function onPortClick(gateId, portType, portIndex, e) {
     source = { gateId }
     target = { gateId: from.gateId, portIndex: from.portIndex }
   } else {
+    addToast(
+      from.portType === portType
+        ? `Cannot connect ${portType} to ${portType}`
+        : 'Invalid connection'
+    )
     wiringFrom.value = null
     return
   }
 
   // no self-connections
   if (source.gateId === target.gateId) {
+    addToast('Cannot connect a gate to itself')
+    wiringFrom.value = null
+    return
+  }
+
+  // duplicate wire check
+  const duplicate = wires.find(w => w.fromGateId === source.gateId && w.toGateId === target.gateId && w.toPort === target.portIndex)
+  if (duplicate) {
+    addToast('This connection already exists')
+    wiringFrom.value = null
+    return
+  }
+
+  // cycle detection
+  if (wouldCreateCycle(target.gateId, source.gateId)) {
+    addToast('Cannot create a cycle in the circuit')
     wiringFrom.value = null
     return
   }
@@ -245,11 +304,18 @@ function exportVerilog() {
 
   if (!inputGates.length && !outputGates.length) return '// place some gates first\n'
 
+  const vWarnings = []
+  if (!inputGates.length) vWarnings.push('// WARNING: no input ports defined')
+  if (!outputGates.length) vWarnings.push('// WARNING: no output ports defined')
+  const issueCount = lintProblems.value.length
+  if (issueCount) vWarnings.push(`// WARNING: ${issueCount} lint issue${issueCount > 1 ? 's' : ''} in circuit`)
+  const warningBlock = vWarnings.length ? vWarnings.join('\n') + '\n\n' : ''
+
   const ins = inputGates.map((_, i) => `in_${i}`)
   const outs = outputGates.map((_, i) => `out_${i}`)
   const ports = [...ins.map(n => `  input  ${n}`), ...outs.map(n => `  output ${n}`)].join(',\n')
 
-  let v = `module circuit (\n${ports}\n);\n\n`
+  let v = warningBlock + `module circuit (\n${ports}\n);\n\n`
 
   for (const gate of logicGates) v += `  wire w_${gate.id};\n`
   if (logicGates.length) v += '\n'
@@ -287,7 +353,155 @@ function exportVerilog() {
   return v
 }
 
+const lintProblems = computed(() => {
+  const problems = []
+
+  // circuit-level checks
+  const hasInputs = gates.some(g => g.type === 'INPUT')
+  const hasOutputs = gates.some(g => g.type === 'OUTPUT')
+  if (gates.length && !hasInputs) problems.push({ severity: 'error', msg: 'Circuit has no INPUT gates', gateId: null, rule: 'no-inputs' })
+  if (gates.length && !hasOutputs) problems.push({ severity: 'warning', msg: 'Circuit has no OUTPUT gates', gateId: null, rule: 'no-outputs' })
+
+  for (const gate of gates) {
+    const def = GATE_TYPES[gate.type]
+    const hasAnyInput = wires.some(w => w.toGateId === gate.id)
+    const hasAnyOutput = wires.some(w => w.fromGateId === gate.id)
+
+    // floating gate
+    if (def.inputs > 0 && def.outputs > 0 && !hasAnyInput && !hasAnyOutput) {
+      problems.push({ severity: 'warning', msg: `${def.label} #${gate.id} is floating (no connections)`, gateId: gate.id, rule: 'floating-gate' })
+      continue
+    }
+
+    // unconnected inputs
+    if (gate.type !== 'INPUT') {
+      const missing = getUnconnectedInputs(gate)
+      if (missing.length) {
+        problems.push({
+          severity: 'error',
+          msg: `${def.label} #${gate.id}: ${missing.length} unconnected input${missing.length > 1 ? 's' : ''} (port ${missing.join(', ')})`,
+          gateId: gate.id,
+          rule: 'unconnected-input',
+        })
+      }
+    }
+
+    // dangling output
+    if (def.outputs > 0 && !hasAnyOutput) {
+      problems.push({ severity: 'warning', msg: `${def.label} #${gate.id}: output not connected`, gateId: gate.id, rule: 'dangling-output' })
+    }
+  }
+
+  return problems
+})
+
+const errorCount = computed(() => lintProblems.value.filter(p => p.severity === 'error').length)
+const warningCount = computed(() => lintProblems.value.filter(p => p.severity === 'warning').length)
+
+const gatesWithProblems = computed(() => {
+  const map = new Map()
+  for (const p of lintProblems.value) {
+    if (p.gateId === null) continue
+    if (!map.has(p.gateId)) map.set(p.gateId, [])
+    map.get(p.gateId).push(p)
+  }
+  return map
+})
+
+const gateSeverity = computed(() => {
+  const map = new Map()
+  for (const [gateId, problems] of gatesWithProblems.value) {
+    map.set(gateId, problems.some(p => p.severity === 'error') ? 'error' : 'warning')
+  }
+  return map
+})
+
 const verilogOutput = computed(() => exportVerilog())
+
+const fanOutPorts = computed(() => {
+  const counts = new Map()
+  for (const w of wires) {
+    counts.set(w.fromGateId, (counts.get(w.fromGateId) || 0) + 1)
+  }
+  const result = []
+  for (const [gateId, count] of counts) {
+    if (count > 1) result.push(gateId)
+  }
+  return result
+})
+
+function focusGate(gateId) {
+  if (gateId === null) return
+  highlightedGateId.value = gateId
+  setTimeout(() => {
+    if (highlightedGateId.value === gateId) highlightedGateId.value = null
+  }, 2000)
+}
+
+function autoOrganize() {
+  if (!gates.length) return
+
+  // topological sort via BFS from inputs
+  const adj = new Map()
+  const inDeg = new Map()
+  for (const g of gates) {
+    adj.set(g.id, [])
+    inDeg.set(g.id, 0)
+  }
+  for (const w of wires) {
+    adj.get(w.fromGateId)?.push(w.toGateId)
+    inDeg.set(w.toGateId, (inDeg.get(w.toGateId) || 0) + 1)
+  }
+
+  const layers = []
+  let queue = []
+  for (const g of gates) {
+    if (inDeg.get(g.id) === 0) queue.push(g.id)
+  }
+
+  const placed = new Set()
+  while (queue.length) {
+    layers.push([...queue])
+    queue.forEach(id => placed.add(id))
+    const next = []
+    for (const id of queue) {
+      for (const toId of adj.get(id) || []) {
+        inDeg.set(toId, inDeg.get(toId) - 1)
+        if (inDeg.get(toId) === 0 && !placed.has(toId)) next.push(toId)
+      }
+    }
+    queue = next
+  }
+
+  // catch unplaced gates (isolated)
+  for (const g of gates) {
+    if (!placed.has(g.id)) {
+      layers.push([g.id])
+      placed.add(g.id)
+    }
+  }
+
+  const xStart = 80
+  const xGap = 140
+  const yGap = 30
+
+  for (let col = 0; col < layers.length; col++) {
+    const layer = layers[col]
+    const totalHeight = layer.reduce((sum, id) => {
+      const g = gates.find(g => g.id === id)
+      return sum + GATE_TYPES[g.type].height
+    }, 0) + (layer.length - 1) * yGap
+    let y = Math.max(40, (500 - totalHeight) / 2)
+
+    for (const id of layer) {
+      const g = gates.find(g => g.id === id)
+      const def = GATE_TYPES[g.type]
+      g.x = xStart + col * xGap
+      g.y = y
+      y += def.height + yGap
+    }
+  }
+}
 
 function onKeyDown(e) {
   if (e.key === 'Escape') {
@@ -326,6 +540,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeyDown))
       <div class="section">
         <div class="section-title">Actions</div>
         <button class="action-btn" @click="selectedTool = null; wiringFrom = null">Pointer</button>
+        <button class="action-btn" @click="autoOrganize">Auto Organize</button>
         <button class="action-btn" @click="clearAll">Clear All</button>
         <button class="action-btn" @click="showVerilog = !showVerilog">
           {{ showVerilog ? 'Hide' : 'Export' }} Verilog
@@ -348,6 +563,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeyDown))
       <div class="status">{{ statusText }}</div>
     </div>
 
+    <div class="main-area">
     <svg
       class="canvas"
       @click="onCanvasClick"
@@ -397,9 +613,20 @@ onUnmounted(() => window.removeEventListener('keydown', onKeyDown))
           :width="GATE_TYPES[gate.type].width"
           :height="GATE_TYPES[gate.type].height"
           :fill="GATE_TYPES[gate.type].color + '20'"
-          :stroke="GATE_TYPES[gate.type].color"
-          stroke-width="2"
+          :stroke="highlightedGateId === gate.id ? '#fff' : GATE_TYPES[gate.type].color"
+          :stroke-width="highlightedGateId === gate.id ? 3 : 2"
           rx="6"
+          :class="{ 'gate-highlighted': highlightedGateId === gate.id }"
+        />
+        <!-- lint severity underline -->
+        <line
+          v-if="gateSeverity.has(gate.id)"
+          :x1="4" :y1="GATE_TYPES[gate.type].height + 4"
+          :x2="GATE_TYPES[gate.type].width - 4" :y2="GATE_TYPES[gate.type].height + 4"
+          :stroke="gateSeverity.get(gate.id) === 'error' ? '#f44336' : '#FF9800'"
+          stroke-width="2"
+          stroke-dasharray="3,2"
+          style="pointer-events: none"
         />
         <!-- label -->
         <text
@@ -412,6 +639,38 @@ onUnmounted(() => window.removeEventListener('keydown', onKeyDown))
           font-weight="bold"
           style="pointer-events: none; user-select: none"
         >{{ GATE_TYPES[gate.type].label }}</text>
+
+        <!-- lint badge -->
+        <g v-if="gateSeverity.has(gate.id)">
+          <title>{{ gatesWithProblems.get(gate.id).map(p => p.msg).join('\n') }}</title>
+          <circle
+            :cx="GATE_TYPES[gate.type].width + 2"
+            :cy="-2"
+            r="8"
+            :fill="gateSeverity.get(gate.id) === 'error' ? '#f44336' : '#FF9800'"
+            opacity="0.9"
+          />
+          <text
+            :x="GATE_TYPES[gate.type].width + 2"
+            :y="-2"
+            text-anchor="middle"
+            dominant-baseline="central"
+            fill="#fff"
+            font-size="11"
+            font-weight="bold"
+            style="pointer-events: none"
+          >{{ gateSeverity.get(gate.id) === 'error' ? 'E' : 'W' }}</text>
+        </g>
+
+        <!-- fan-out junction dot -->
+        <circle
+          v-if="fanOutPorts.includes(gate.id)"
+          :cx="GATE_TYPES[gate.type].width"
+          :cy="GATE_TYPES[gate.type].height / 2"
+          r="3"
+          fill="#4CAF50"
+          style="pointer-events: none"
+        />
 
         <!-- INPUT value text -->
         <text
@@ -466,6 +725,39 @@ onUnmounted(() => window.removeEventListener('keydown', onKeyDown))
         />
       </g>
     </svg>
+
+    <div class="toast-container">
+      <div v-for="t in toasts" :key="t.id" :class="['toast', 'toast-' + t.type]">
+        {{ t.msg }}
+      </div>
+    </div>
+
+    <!-- problems panel  -->
+    <div class="problems-panel" :class="{ collapsed: !showProblems }">
+      <div class="problems-header" @click="showProblems = !showProblems">
+        <span class="problems-title">PROBLEMS</span>
+        <span class="problems-counts">
+          <span v-if="errorCount" class="count-error">{{ errorCount }}</span>
+          <span v-if="warningCount" class="count-warning">{{ warningCount }}</span>
+          <span v-if="!errorCount && !warningCount" class="count-ok">0</span>
+        </span>
+        <span class="problems-toggle">{{ showProblems ? '\u25BC' : '\u25B2' }}</span>
+      </div>
+      <div v-if="showProblems" class="problems-list">
+        <div v-if="!lintProblems.length" class="problems-empty">No problems detected</div>
+        <div
+          v-for="(problem, i) in lintProblems"
+          :key="i"
+          :class="['problem-item', 'problem-' + problem.severity]"
+          @click="focusGate(problem.gateId)"
+        >
+          <span class="problem-icon">{{ problem.severity === 'error' ? '\u2716' : '\u26A0' }}</span>
+          <span class="problem-msg">{{ problem.msg }}</span>
+          <span class="problem-rule">{{ problem.rule }}</span>
+        </div>
+      </div>
+    </div>
+    </div>
   </div>
 </template>
 
@@ -596,10 +888,18 @@ body {
   border-top: 1px solid #222;
 }
 
+.main-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
 .canvas {
   flex: 1;
   background: #0d0d1a;
   cursor: crosshair;
+  width: 100%;
 }
 
 .gate-node {
@@ -627,5 +927,148 @@ body {
 .wire:hover {
   stroke: #fff !important;
   filter: drop-shadow(0 0 4px rgba(255,255,255,0.3));
+}
+
+.gate-highlighted {
+  animation: highlight-pulse 0.6s ease-in-out 3;
+}
+
+@keyframes highlight-pulse {
+  0%, 100% { filter: none; }
+  50% { filter: drop-shadow(0 0 8px #fff); }
+}
+
+.toast-container {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 100;
+  pointer-events: none;
+}
+
+.toast {
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  animation: toast-in 0.2s ease-out;
+}
+
+.toast-error { background: #b71c1c; color: #fff; }
+.toast-warning { background: #e65100; color: #fff; }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(20px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.problems-panel {
+  background: #111122;
+  border-top: 1px solid #222;
+  font-size: 12px;
+  max-height: 200px;
+  display: flex;
+  flex-direction: column;
+}
+
+.problems-panel.collapsed {
+  max-height: none;
+}
+
+.problems-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  cursor: pointer;
+  user-select: none;
+  border-bottom: 1px solid #222;
+  flex-shrink: 0;
+}
+
+.problems-header:hover {
+  background: #1a1a2e;
+}
+
+.problems-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: #888;
+  letter-spacing: 1px;
+}
+
+.problems-counts {
+  display: flex;
+  gap: 8px;
+}
+
+.count-error {
+  color: #f44336;
+  font-weight: 600;
+}
+
+.count-error::before { content: '\2716 '; font-size: 10px; }
+
+.count-warning {
+  color: #FF9800;
+  font-weight: 600;
+}
+
+.count-warning::before { content: '\26A0 '; font-size: 10px; }
+
+.count-ok {
+  color: #4CAF50;
+  font-weight: 600;
+}
+
+.count-ok::before { content: '\2714 '; font-size: 10px; }
+
+.problems-toggle {
+  margin-left: auto;
+  color: #555;
+  font-size: 10px;
+}
+
+.problems-list {
+  overflow-y: auto;
+  flex: 1;
+}
+
+.problems-empty {
+  padding: 12px;
+  color: #4CAF50;
+  text-align: center;
+  font-style: italic;
+}
+
+.problem-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid #1a1a2e;
+}
+
+.problem-item:hover {
+  background: #1a1a2e;
+}
+
+.problem-error .problem-icon { color: #f44336; }
+.problem-warning .problem-icon { color: #FF9800; }
+
+.problem-msg {
+  flex: 1;
+  color: #ccc;
+}
+
+.problem-rule {
+  color: #555;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 10px;
 }
 </style>
