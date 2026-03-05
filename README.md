@@ -29,6 +29,8 @@ Built as a graphical alternative to writing raw Verilog for simple combinational
 - **Visual wiring** — click output port, then input port. Bezier curves connect them
 - **Live simulation** — toggle inputs and watch values propagate instantly. Wires glow green on logic 1
 - **Drag & rearrange** — reposition gates freely on the canvas
+- **Circuit linter** — real-time validation panel with error/warning diagnostics (see below)
+- **Auto organize** — topological sort layout to clean up your schematic in one click
 - **Verilog export** — generate synthesizable `assign`-based combinational Verilog from your schematic
 - **Zero dependencies** — pure Vue 3, no external UI libraries
 
@@ -54,7 +56,28 @@ Open [http://localhost:5173](http://localhost:5173)
 | Delete a gate | Right-click the gate |
 | Delete a wire | Right-click the wire |
 | Cancel operation | Press `Esc` |
+| Auto organize | Click **Auto Organize** in the sidebar |
 | Export Verilog | Click **Export Verilog** in the sidebar |
+
+## Circuit Linter
+
+A VS Code-style problems panel at the bottom validates your circuit in real-time:
+
+| Rule | Severity | Description |
+|---|---|---|
+| `no-inputs` | Error | Circuit has no INPUT gates |
+| `no-outputs` | Warning | Circuit has no OUTPUT gates |
+| `unconnected-input` | Error | Gate has input ports with no wire connected |
+| `dangling-output` | Warning | Gate output isn't driving anything |
+| `floating-gate` | Warning | Gate has zero connections at all |
+
+Connection-time validation prevents:
+- **Cycles** — combinational loops are blocked with feedback
+- **Duplicate wires** — same source-to-destination connection
+- **Self-connections** — a gate wired to itself
+- **Same-type port connections** — output-to-output or input-to-input
+
+Click any diagnostic in the problems panel to highlight the offending gate on the canvas.
 
 ## Verilog Export
 
